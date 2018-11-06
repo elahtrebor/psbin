@@ -6,7 +6,6 @@ cp
 curl
 grep
 head
-hello
 ls
 mv
 ps
