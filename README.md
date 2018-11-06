@@ -20,7 +20,9 @@ wc
 
 Tested using PS V5.1
 
-This was created to help get a minimal subset of functionality as ran across a Windows system that did not have access for installing existing linux tools, but did have powershell...
+This is a very minimal subset of many common linux tools made for Windows. Requires Powershell.
+
+This was created to help get a minimal subset of functionality as ran across a Windows system that did not have access for installing existing linux tools. 
 
 The powershell code is wrapped in BAT files to allow to call each by familiar name. The tools process data via pipe.
 
