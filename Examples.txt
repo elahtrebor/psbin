@@ -1,0 +1,93 @@
+>cat test.txt|head -10
+5
+2
+3
+1
+4
+6
+9
+7
+8
+a
+
+>cat test.txt|head -10|sort
+1
+2
+3
+4
+5
+6
+7
+8
+9
+a
+
+>cat test.csv |head -20
+1,a,b,c,d
+2,a,b,c,d
+3,a,b,c,d
+4,a,b,c,d
+5,a,b,c,d
+6,a,b,c,d
+7,a,b,c,d
+8,a,b,c,d
+9,a,b,c,d
+10,a,b,c,d
+11,a,b,c,d
+12,a,b,c,d
+13,a,b,c,d
+14,a,b,c,d
+15,a,b,c,d
+16,a,b,c,d
+17,a,b,c,d
+18,a,b,c,d
+19,a,b,c,d
+20,a,b,c,d
+
+>cat test.csv|grep 1[0-9]
+10,a,b,c,d
+11,a,b,c,d
+12,a,b,c,d
+13,a,b,c,d
+14,a,b,c,d
+15,a,b,c,d
+16,a,b,c,d
+17,a,b,c,d
+18,a,b,c,d
+19,a,b,c,d
+
+>cat test.csv|grep 1[0-9]|sed "2d"
+10,a,b,c,d
+12,a,b,c,d
+13,a,b,c,d
+14,a,b,c,d
+15,a,b,c,d
+16,a,b,c,d
+17,a,b,c,d
+18,a,b,c,d
+19,a,b,c,d
+
+>cat test.csv|grep 1[0-9]|awk -F, "{print $1}"
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+
+
+>ls|grep csv
+test.csv
+
+
+>ps |grep cmd
+     54       5     5560       3720       0.02   2680   2 cmd
+    308      16     7160      17276      11.59   3312   2 cmd
+     54       5     4536       3708       0.02  13080   2 cmd
+     
+     
+
