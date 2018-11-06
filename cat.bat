@@ -9,7 +9,7 @@
 $progressPreference = 'silentlyContinue' 
 
 if($Args[0] -match '-h'){
- echo "wc - Emulates a minimal linux cat (concatenate)."
+ echo "cat - Emulates a minimal linux cat (concatenate)."
  echo "use cat <FLAG> <FILENAME>"
  echo "Where flag is:"
  echo "-n        print line numbers"
