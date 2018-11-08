@@ -1,4 +1,4 @@
-# powershell2linux
+# psbin
 subset of ports for common linux tools using powershell
 awk 
 cat 
