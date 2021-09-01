@@ -10,10 +10,7 @@ $progressPreference = 'silentlyContinue'
 
 
 function help1 {
- echo "emulates the minimal linux awk functionality of '{print `$1 `$2 `$3 }'"
- echo "Please use awk -F, ""`{print `$1 `$2 `$3 `}"""
- echo "example: cat test.txt|awk "","" 1 2 3"
- echo "Note: Windows must use Double Quote.."
+ echo "emulates the minimal linux awk functionality of '{print `$1 , `$2 , `$3}'"
  exit
 }
 
@@ -22,7 +19,7 @@ if ( $Args.count -lt 1 ) {
  help1
 }
 
-$delim = " "
+$delim = "[\s]+"
 $expr = ""
 
 # parse for flag
@@ -46,16 +43,25 @@ $delim = $Args[0]
 
 $expr = $expr -replace "{", ""
 $expr = $expr -replace "}", ""
+$expr = $expr -replace ",", " , "
+
 $exprArr = $expr -split " "
+
 
 
 foreach ($line in $input){
   $arr = $line -split $delim 
-  foreach ($n in $exprArr){
-     if($n -match "print"){} 
+  foreach ($elem in $exprArr){
+     if($elem -match "print"){ } 
+  elseif($elem -match ","){
+       Write-Host -NoNewLine " " 
+       }
        else {
-       $n = $n -replace "\$", ""
-       write-host -nonewline "$($arr[$n - 1]) "
+       $elem = $elem -replace "\$", ""
+        if($elem -eq "NF"){
+          $elem = $arr.Count
+         }
+       Write-Host -NoNewLine $arr[$elem - 1]
       } 
    }
  echo ""
