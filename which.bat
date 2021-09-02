@@ -31,5 +31,4 @@ foreach ($dir in $paths){
 }
 
 
-#$Args[0] -eq '-c'){
  
