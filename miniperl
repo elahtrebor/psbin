@@ -1,0 +1,862 @@
+<#
+miniperl.ps1 - a small Perl-ish interpreter written in PowerShell.
+
+Run:
+  pwsh ./miniperl.ps1 program.mpl
+
+This mirrors the awkperl/miniperl.awk subset: scalars ($x), arrays (@a),
+hashes (%h["key"] or $h{"key"}), regex helpers, foreach, simple
+conditionals, subroutines, module loading, file IO, and command capture.
+#>
+
+param(
+    [Parameter(Mandatory = $true, Position = 0)]
+    [string]$ProgramPath
+)
+
+$script:Program = @()
+$script:StrictMode = $false
+$script:CurrentLine = 0
+$script:SubCallDepth = 0
+$script:Returning = $false
+$script:ReturnValue = ''
+
+$script:Scalars = @{}
+$script:Arrays = @{}
+$script:Hashes = @{}
+$script:DeclaredScalars = @{}
+$script:DeclaredArrays = @{}
+$script:DeclaredHashes = @{}
+$script:LoadedModules = @{}
+$script:SubStart = @{}
+$script:SubEnd = @{}
+
+function Die([string]$Message, [int]$LineNo = 0) {
+    if ($LineNo -gt 0) {
+        [Console]::Error.WriteLine("miniperl:{0}: {1}" -f $LineNo, $Message)
+    } else {
+        [Console]::Error.WriteLine("miniperl: {0}" -f $Message)
+    }
+    exit 1
+}
+
+function Trim-Text($Value) {
+    if ($null -eq $Value) { return '' }
+    return ([string]$Value).Trim()
+}
+
+function Strip-TrailingSemicolon([string]$Text) {
+    return (Trim-Text $Text) -replace '\s*;\s*$', ''
+}
+
+function Strip-Comment([string]$Text) {
+    $quote = ''
+    $prev = ''
+    $out = [System.Text.StringBuilder]::new()
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $c = $Text[$i]
+        if ($quote -eq '' -and $c -eq '#') { break }
+        if (($c -eq '"' -or $c -eq "'") -and $prev -ne '\') {
+            if ($quote -eq '') { $quote = [string]$c }
+            elseif ($quote -eq [string]$c) { $quote = '' }
+        }
+        [void]$out.Append($c)
+        $prev = [string]$c
+    }
+    return (Trim-Text $out.ToString())
+}
+
+function Unquote([string]$Text) {
+    $s = Trim-Text $Text
+    if ($s.Length -ge 2) {
+        $q = $s[0]
+        if (($q -eq '"' -or $q -eq "'") -and $s[$s.Length - 1] -eq $q) {
+            $s = $s.Substring(1, $s.Length - 2)
+            if ($q -eq '"') {
+                $s = $s -replace '\\n', "`n"
+                $s = $s -replace '\\t', "`t"
+                $s = $s -replace '\\"', '"'
+                $s = $s -replace '\\\\', '\'
+            }
+        }
+    }
+    return $s
+}
+
+function Declare-Scalar([string]$Name) { $script:DeclaredScalars[$Name] = $true }
+function Declare-Array([string]$Name) {
+    $script:DeclaredArrays[$Name] = $true
+    if (-not $script:Arrays.ContainsKey($Name)) { $script:Arrays[$Name] = [System.Collections.ArrayList]::new() }
+}
+function Declare-Hash([string]$Name) {
+    $script:DeclaredHashes[$Name] = $true
+    if (-not $script:Hashes.ContainsKey($Name)) { $script:Hashes[$Name] = @{} }
+}
+
+function Require-Scalar([string]$Name, [int]$LineNo = 0) {
+    if ($script:StrictMode -and -not $script:DeclaredScalars.ContainsKey($Name)) {
+        if ($LineNo -eq 0) { $LineNo = $script:CurrentLine }
+        Die "Global symbol `"$${Name}`" requires explicit package name (did you forget my?)" $LineNo
+    }
+}
+
+function Require-Array([string]$Name, [int]$LineNo = 0) {
+    if ($script:StrictMode -and -not $script:DeclaredArrays.ContainsKey($Name)) {
+        if ($LineNo -eq 0) { $LineNo = $script:CurrentLine }
+        Die "Global symbol `"@${Name}`" requires explicit package name (did you forget my?)" $LineNo
+    }
+    if (-not $script:Arrays.ContainsKey($Name)) { $script:Arrays[$Name] = [System.Collections.ArrayList]::new() }
+}
+
+function Require-Hash([string]$Name, [int]$LineNo = 0) {
+    if ($script:StrictMode -and -not $script:DeclaredHashes.ContainsKey($Name)) {
+        if ($LineNo -eq 0) { $LineNo = $script:CurrentLine }
+        Die "Global symbol `"%${Name}`" requires explicit package name (did you forget my?)" $LineNo
+    }
+    if (-not $script:Hashes.ContainsKey($Name)) { $script:Hashes[$Name] = @{} }
+}
+
+function Find-Top([string]$Text, [string]$Op) {
+    $quote = ''
+    $prev = ''
+    $depth = 0
+    $limit = $Text.Length - $Op.Length
+    for ($i = 0; $i -le $limit; $i++) {
+        $c = $Text[$i]
+        if (($c -eq '"' -or $c -eq "'") -and $prev -ne '\') {
+            if ($quote -eq '') { $quote = [string]$c }
+            elseif ($quote -eq [string]$c) { $quote = '' }
+        } elseif ($quote -eq '') {
+            if ($c -eq '(' -or $c -eq '[' -or $c -eq '{') { $depth++ }
+            elseif ($c -eq ')' -or $c -eq ']' -or $c -eq '}') { $depth-- }
+            elseif ($depth -eq 0 -and $Text.Substring($i, $Op.Length) -eq $Op) { return $i }
+        }
+        $prev = [string]$c
+    }
+    return -1
+}
+
+function Split-Args([string]$Text) {
+    $items = [System.Collections.ArrayList]::new()
+    $quote = ''
+    $prev = ''
+    $depth = 0
+    $inRegex = $false
+    $part = [System.Text.StringBuilder]::new()
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $c = $Text[$i]
+        if ($quote -eq '' -and $c -eq '/' -and $prev -ne '\') {
+            $inRegex = -not $inRegex
+            [void]$part.Append($c)
+        } elseif (-not $inRegex -and ($c -eq '"' -or $c -eq "'") -and $prev -ne '\') {
+            if ($quote -eq '') { $quote = [string]$c }
+            elseif ($quote -eq [string]$c) { $quote = '' }
+            [void]$part.Append($c)
+        } elseif ($quote -eq '' -and -not $inRegex) {
+            if ($c -eq '(' -or $c -eq '[' -or $c -eq '{') {
+                $depth++
+                [void]$part.Append($c)
+            } elseif ($c -eq ')' -or $c -eq ']' -or $c -eq '}') {
+                $depth--
+                [void]$part.Append($c)
+            } elseif ($c -eq ',' -and $depth -eq 0) {
+                [void]$items.Add((Trim-Text $part.ToString()))
+                $part.Clear() | Out-Null
+            } else {
+                [void]$part.Append($c)
+            }
+        } else {
+            [void]$part.Append($c)
+        }
+        $prev = [string]$c
+    }
+    $last = Trim-Text $part.ToString()
+    if ($last -ne '' -or $items.Count -gt 0) { [void]$items.Add($last) }
+    return @($items)
+}
+
+function Get-RegexBody([string]$Text) {
+    $s = Trim-Text $Text
+    if (-not ($s.StartsWith('/') -and $s.EndsWith('/'))) { Die 'expected /regex/' }
+    return $s.Substring(1, $s.Length - 2)
+}
+
+function Is-RegexLiteral([string]$Text) {
+    $s = Trim-Text $Text
+    return $s.StartsWith('/') -and $s.EndsWith('/')
+}
+
+function Get-ArrayName([string]$Expr) {
+    $s = Trim-Text $Expr
+    if ($s -notmatch '^@[A-Za-z_][A-Za-z0-9_]*$') { Die 'expected @array' }
+    $name = $s.Substring(1)
+    Require-Array $name
+    return $name
+}
+
+function Get-ArrayValue([string]$Name, [int]$Index) {
+    Require-Array $Name
+    $arr = $script:Arrays[$Name]
+    if ($Index -lt 0) { $Index = $arr.Count + $Index }
+    if ($Index -lt 0 -or $Index -ge $arr.Count) { return '' }
+    return [string]$arr[$Index]
+}
+
+function Set-ArrayValue([string]$Name, [int]$Index, $Value) {
+    Require-Array $Name
+    $arr = $script:Arrays[$Name]
+    while ($arr.Count -le $Index) { [void]$arr.Add('') }
+    $arr[$Index] = [string]$Value
+}
+
+function Clear-ArrayValue([string]$Name) {
+    Require-Array $Name
+    $script:Arrays[$Name].Clear()
+}
+
+function Get-HashName([string]$Expr) {
+    $s = Trim-Text $Expr
+    if ($s.StartsWith('%')) {
+        $p = $s.IndexOf('[')
+        if ($p -lt 0) { Die 'expected %hash[key]' }
+        $name = $s.Substring(1, $p - 1)
+    } elseif ($s.StartsWith('$')) {
+        $p = $s.IndexOf('{')
+        if ($p -lt 0) { Die 'expected $hash{key}' }
+        $name = $s.Substring(1, $p - 1)
+    } else {
+        Die 'expected %hash[key] or $hash{key}'
+    }
+    Require-Hash $name
+    return $name
+}
+
+function Get-HashKey([string]$Expr) {
+    $s = Trim-Text $Expr
+    if ($s.StartsWith('%')) {
+        $p = $s.IndexOf('[')
+        $key = $s.Substring($p + 1, $s.Length - $p - 2)
+    } elseif ($s.StartsWith('$')) {
+        $p = $s.IndexOf('{')
+        $key = $s.Substring($p + 1, $s.Length - $p - 2)
+    } else {
+        Die 'expected %hash[key] or $hash{key}'
+    }
+    return (Eval-Expr $key)
+}
+
+function Invoke-MiniCommand([string]$Command) {
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    if ($IsWindows) {
+        $psi.FileName = 'cmd.exe'
+        $psi.ArgumentList.Add('/c')
+    } else {
+        $psi.FileName = '/bin/sh'
+        $psi.ArgumentList.Add('-c')
+    }
+    $psi.ArgumentList.Add($Command)
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit()
+    return $out.TrimEnd("`r", "`n")
+}
+
+function Replace-Regex([string]$Text, [string]$Pattern, [string]$Replacement, [string]$Flags) {
+    if ($Flags -eq 'g' -or $Flags -eq 'G') {
+        return [regex]::Replace($Text, $Pattern, $Replacement)
+    }
+    return [regex]::Replace($Text, $Pattern, $Replacement, 1)
+}
+
+function Extract-Between([string]$Text, [string]$Left, [string]$Right) {
+    $m = [regex]::Match($Text, $Left)
+    if (-not $m.Success) { return '' }
+    $rest = $Text.Substring($m.Index + $m.Length)
+    $r = [regex]::Match($rest, $Right)
+    if (-not $r.Success) { return '' }
+    return $rest.Substring(0, $r.Index)
+}
+
+function Eval-Expr([string]$Expr) {
+    $expr = Trim-Text $Expr
+    if ($expr -eq '') { return '' }
+
+    if ($expr.StartsWith('(') -and $expr.EndsWith(')') -and (Find-Top ($expr.Substring(1, $expr.Length - 2)) ')') -lt 0) {
+        return (Eval-Expr ($expr.Substring(1, $expr.Length - 2)))
+    }
+
+    foreach ($op in @('||', '&&', '!~', '=~', '==', '!=', '>=', '<=', '>', '<', '.', '+', '-', '*', '/')) {
+        $p = Find-Top $expr $op
+        if ($p -ge 0) {
+            $lhs = Eval-Expr $expr.Substring(0, $p)
+            $rhsText = $expr.Substring($p + $op.Length)
+            if ($op -eq '=~' -or $op -eq '!~') {
+                $matched = ([string]$lhs) -match (Get-RegexBody $rhsText)
+                if ($op -eq '=~') { return $matched }
+                return (-not $matched)
+            }
+            $rhs = Eval-Expr $rhsText
+            switch ($op) {
+                '||' { return ([bool]$lhs -or [bool]$rhs) }
+                '&&' { return ([bool]$lhs -and [bool]$rhs) }
+                '==' { return ([double]$lhs -eq [double]$rhs) }
+                '!=' { return ([string]$lhs -ne [string]$rhs) }
+                '>=' { return ([double]$lhs -ge [double]$rhs) }
+                '<=' { return ([double]$lhs -le [double]$rhs) }
+                '>' { return ([double]$lhs -gt [double]$rhs) }
+                '<' { return ([double]$lhs -lt [double]$rhs) }
+                '.' { return ([string]$lhs + [string]$rhs) }
+                '+' { return ([double]$lhs + [double]$rhs) }
+                '-' { return ([double]$lhs - [double]$rhs) }
+                '*' { return ([double]$lhs * [double]$rhs) }
+                '/' {
+                    if ([double]$rhs -eq 0) { Die 'division by zero' }
+                    return ([double]$lhs / [double]$rhs)
+                }
+            }
+        }
+    }
+
+    if ($expr -match '^".*"$' -or $expr -match "^'.*'$") { return (Unquote $expr) }
+    if ($expr -match '^-?[0-9]+([.][0-9]+)?$') { return [double]$expr }
+
+    if ($expr -match '^\$([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]$') {
+        return Get-ArrayValue $Matches[1] ([int](Eval-Expr $Matches[2]))
+    }
+    if ($expr -match '^@([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]$') {
+        return Get-ArrayValue $Matches[1] ([int](Eval-Expr $Matches[2]))
+    }
+    if ($expr -match '^\$([A-Za-z_][A-Za-z0-9_]*)\{(.+)\}$') {
+        $name = $Matches[1]
+        Require-Hash $name
+        $key = Eval-Expr $Matches[2]
+        if ($script:Hashes[$name].ContainsKey($key)) { return $script:Hashes[$name][$key] }
+        return ''
+    }
+    if ($expr -match '^\$([A-Za-z_][A-Za-z0-9_]*)$') {
+        $name = $Matches[1]
+        Require-Scalar $name
+        if ($script:Scalars.ContainsKey($name)) { return $script:Scalars[$name] }
+        return ''
+    }
+
+    if ($expr -match '^([A-Za-z_][A-Za-z0-9_]*(\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\((.*)\)$') {
+        $name = ($Matches[1] -replace '\s*::\s*', '::')
+        $argList = @(Split-Args $Matches[3])
+        switch ($name) {
+            'lc' { return ([string](Eval-Expr $argList[0])).ToLowerInvariant() }
+            'uc' { return ([string](Eval-Expr $argList[0])).ToUpperInvariant() }
+            'length' { return ([string](Eval-Expr $argList[0])).Length }
+            'scalar' {
+                if ($argList.Count -ne 1) { Die 'scalar expects one argument' }
+                if ((Trim-Text $argList[0]) -match '^@([A-Za-z_][A-Za-z0-9_]*)$') {
+                    Require-Array $Matches[1]
+                    return $script:Arrays[$Matches[1]].Count
+                }
+                return (Eval-Expr $argList[0])
+            }
+            'join' {
+                if ($argList.Count -ne 2) { Die 'join expects separator, @array' }
+                $arrName = Get-ArrayName $argList[1]
+                return [string]::Join([string](Eval-Expr $argList[0]), [string[]]$script:Arrays[$arrName])
+            }
+            'chomp' {
+                return ([string](Eval-Expr $argList[0])) -replace "\r?\n$", ''
+            }
+            'chop' {
+                $s = [string](Eval-Expr $argList[0])
+                if ($s.Length -eq 0) { return '' }
+                return $s.Substring(0, $s.Length - 1)
+            }
+            'subst' {
+                $flags = if ($argList.Count -ge 4) { [string](Eval-Expr $argList[3]) } else { '1' }
+                return Replace-Regex ([string](Eval-Expr $argList[0])) (Get-RegexBody $argList[1]) ([string](Eval-Expr $argList[2])) $flags
+            }
+            'matchstr' {
+                $m = [regex]::Match([string](Eval-Expr $argList[0]), (Get-RegexBody $argList[1]))
+                if ($m.Success) { return $m.Value }
+                return ''
+            }
+            'between' { return Extract-Between ([string](Eval-Expr $argList[0])) (Get-RegexBody $argList[1]) (Get-RegexBody $argList[2]) }
+            'read' {
+                $path = [string](Eval-Expr $argList[0])
+                if (-not (Test-Path -LiteralPath $path)) { return '' }
+                return (Get-Content -LiteralPath $path -Raw).TrimEnd("`r", "`n")
+            }
+            'run' { return Invoke-MiniCommand ([string](Eval-Expr $argList[0])) }
+            'pop' {
+                $arrName = Get-ArrayName $argList[0]
+                $arr = $script:Arrays[$arrName]
+                if ($arr.Count -eq 0) { return '' }
+                $v = $arr[$arr.Count - 1]
+                $arr.RemoveAt($arr.Count - 1)
+                return $v
+            }
+            'shift' {
+                $arrName = Get-ArrayName $argList[0]
+                $arr = $script:Arrays[$arrName]
+                if ($arr.Count -eq 0) { return '' }
+                $v = $arr[0]
+                $arr.RemoveAt(0)
+                return $v
+            }
+            'exists' {
+                $hashName = Get-HashName $argList[0]
+                $key = Get-HashKey $argList[0]
+                return $script:Hashes[$hashName].ContainsKey($key)
+            }
+            default {
+                if ($script:SubStart.ContainsKey($name)) { return Invoke-UserSub -Name $name -ArgList $argList }
+                Die "unknown function: $name"
+            }
+        }
+    }
+
+    return $expr
+}
+
+function Get-ModulePath([string]$ModuleName) {
+    return (($ModuleName -replace '::', [System.IO.Path]::DirectorySeparatorChar) + '.pm')
+}
+
+function Qualify-ModuleSubLine([string]$Line, [string]$ModuleName) {
+    if ($Line -notmatch '^\s*sub\s+([A-Za-z_][A-Za-z0-9_]*(\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\{\s*$') { return $Line }
+    $subName = ($Matches[1] -replace '\s*::\s*', '::')
+    if ($subName -like '*::*') { return $Line }
+    return ($Line -replace 'sub\s+[A-Za-z_][A-Za-z0-9_]*', ('sub {0}::{1}' -f $ModuleName, $subName))
+}
+
+function Load-Modules([string]$BaseDir) {
+    $changed = $true
+    while ($changed) {
+        $changed = $false
+        for ($i = 0; $i -lt $script:Program.Count; $i++) {
+            $line = Strip-TrailingSemicolon (Strip-Comment $script:Program[$i])
+            if ($line -notmatch '^use\s+([A-Za-z_][A-Za-z0-9_:]*)$') { continue }
+            $module = $Matches[1]
+            if ($module -eq 'strict' -or $module -eq 'warnings') { continue }
+            if ($script:LoadedModules.ContainsKey($module)) {
+                $script:Program[$i] = ''
+                continue
+            }
+            $path = Join-Path $BaseDir (Get-ModulePath $module)
+            if (-not (Test-Path -LiteralPath $path)) { Die "could not load module $module from $(Get-ModulePath $module)" }
+            $script:LoadedModules[$module] = $true
+            $script:Program[$i] = ''
+            foreach ($raw in Get-Content -LiteralPath $path) {
+                $mline = Strip-TrailingSemicolon $raw
+                if ((Trim-Text $mline) -match '^package\s+[A-Za-z_][A-Za-z0-9_:]*$') { continue }
+                if ((Trim-Text $mline) -eq '1') { continue }
+                $script:Program += (Qualify-ModuleSubLine $mline $module)
+            }
+            $changed = $true
+        }
+    }
+}
+
+function Normalize-Program {
+    $out = @()
+    foreach ($line in $script:Program) {
+        if ($line -match '^\s*\}\s*(elsif|else)(\s|\{|$)') {
+            $out += '}'
+            $out += ($line -replace '^\s*\}\s*', '')
+        } else {
+            $out += $line
+        }
+    }
+    $script:Program = @($out)
+}
+
+function Parse-SubHeader([string]$Line) {
+    $l = Trim-Text $Line
+    if ($l -match '^sub\s+([A-Za-z_][A-Za-z0-9_]*(\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\{\s*$') {
+        return ($Matches[1] -replace '\s*::\s*', '::')
+    }
+    return $null
+}
+
+function Find-BlockEnd([int]$Start, [int]$Stop) {
+    $depth = 0
+    for ($i = $Start; $i -le $Stop; $i++) {
+        $line = Strip-Comment $script:Program[$i]
+        if ($line -match '\{\s*$') { $depth++ }
+        if ($line -match '^\}') {
+            $depth--
+            if ($depth -eq 0) { return $i }
+        }
+    }
+    Die 'missing }' ($Start + 1)
+}
+
+function Index-Subroutines {
+    for ($i = 0; $i -lt $script:Program.Count; $i++) {
+        $name = Parse-SubHeader (Strip-Comment $script:Program[$i])
+        if ($null -ne $name) {
+            $end = Find-BlockEnd $i ($script:Program.Count - 1)
+            $script:SubStart[$name] = $i
+            $script:SubEnd[$name] = $end
+            $i = $end
+        }
+    }
+}
+
+function Parse-ForeachHeader([string]$Line) {
+    $l = Trim-Text $Line
+    if ($l -match '^foreach\s+(my\s+)?\$([A-Za-z_][A-Za-z0-9_]*)\s+in\s+@([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$') {
+        return @{ Name = $Matches[2]; Array = $Matches[3]; Declared = ($Matches[1] -ne '') }
+    }
+    if ($l -match '^for(each)?\s+(my\s+)?\$([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*@([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\{\s*$') {
+        return @{ Name = $Matches[3]; Array = $Matches[4]; Declared = ($Matches[2] -ne '') }
+    }
+    if ($l -match '^for(each)?\s*\(\s*@([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\{\s*$') {
+        return @{ Name = '_'; Array = $Matches[2]; Declared = $true }
+    }
+    return $null
+}
+
+function Parse-CondHeader([string]$Keyword, [string]$Line) {
+    $l = Trim-Text $Line
+    if ($l.StartsWith('}')) { $l = Trim-Text $l.Substring(1) }
+    if ($l -notmatch "^$Keyword(\s|\().*\{.*$") { return $null }
+    $expr = $l -replace "^$Keyword\s*", ''
+    $inline = $false
+    $stmt = ''
+    if ($expr -match '\{\s*$') {
+        $expr = $expr -replace '\{\s*$', ''
+    } elseif ($expr -match '\{.*\}\s*$') {
+        $inline = $true
+        $stmtText = (($expr -replace '^.*\{\s*', '') -replace '\s*\}\s*$', '')
+        $stmt = Strip-TrailingSemicolon $stmtText
+        $expr = $expr -replace '\{.*$', ''
+    } else {
+        return $null
+    }
+    $expr = Trim-Text $expr
+    if ($expr.StartsWith('(') -and $expr.EndsWith(')')) { $expr = Trim-Text $expr.Substring(1, $expr.Length - 2) }
+    return @{ Expr = $expr; Inline = $inline; Stmt = $stmt }
+}
+
+function Parse-ElseHeader([string]$Line) {
+    $l = Trim-Text $Line
+    if ($l.StartsWith('}')) { $l = Trim-Text $l.Substring(1) }
+    if ($l -notmatch '^else\s*\{.*$') { return $null }
+    $expr = $l -replace '^else\s*', ''
+    if ($expr -match '\{\s*$') { return @{ Inline = $false; Stmt = '' } }
+    if ($expr -match '\{.*\}\s*$') {
+        $stmtText = (($expr -replace '^.*\{\s*', '') -replace '\s*\}\s*$', '')
+        return @{ Inline = $true; Stmt = (Strip-TrailingSemicolon $stmtText) }
+    }
+    return $null
+}
+
+function Next-CodeLine([int]$Pc, [int]$Stop) {
+    while ($Pc -le $Stop) {
+        if ((Strip-Comment $script:Program[$Pc]) -ne '') { return $Pc }
+        $Pc++
+    }
+    return $Pc
+}
+
+function Skip-IfTail([int]$Pc, [int]$Stop) {
+    while ($Pc -le $Stop) {
+        $branch = Next-CodeLine $Pc $Stop
+        if ($branch -gt $Stop) { return $branch }
+        $line = Strip-Comment $script:Program[$branch]
+        if ($null -ne (Parse-CondHeader 'elsif' $line)) {
+            $end = Find-BlockEnd $branch $Stop
+            $Pc = $end + 1
+            continue
+        }
+        if ($null -ne (Parse-ElseHeader $line)) {
+            $end = Find-BlockEnd $branch $Stop
+            return ($end + 1)
+        }
+        return $branch
+    }
+    return $Pc
+}
+
+function Invoke-UserSub([string]$Name, [object[]]$ArgList) {
+    if (-not $script:SubStart.ContainsKey($Name)) { Die "unknown function: $Name" }
+    $oldReturning = $script:Returning
+    $oldReturnValue = $script:ReturnValue
+    $oldArgs = if ($script:Arrays.ContainsKey('_')) { @($script:Arrays['_']) } else { $null }
+    $hadOldUnderscore = $script:Scalars.ContainsKey('_')
+    $oldUnderscore = if ($hadOldUnderscore) { $script:Scalars['_'] } else { $null }
+
+    $script:Returning = $false
+    $script:ReturnValue = ''
+    Declare-Array '_'
+    Declare-Scalar '_'
+    Clear-ArrayValue '_'
+    foreach ($arg in $ArgList) { [void]$script:Arrays['_'].Add([string](Eval-Expr $arg)) }
+    $script:Scalars['_'] = if ($script:Arrays['_'].Count -gt 0) { $script:Arrays['_'][0] } else { '' }
+
+    $script:SubCallDepth++
+    Exec-Block ($script:SubStart[$Name] + 1) ($script:SubEnd[$Name] - 1)
+    $script:SubCallDepth--
+    $result = $script:ReturnValue
+
+    if ($null -ne $oldArgs) {
+        $script:Arrays['_'] = [System.Collections.ArrayList]::new()
+        foreach ($item in $oldArgs) { [void]$script:Arrays['_'].Add($item) }
+    } else {
+        $script:Arrays.Remove('_')
+    }
+    if ($hadOldUnderscore) { $script:Scalars['_'] = $oldUnderscore }
+    else { $script:Scalars.Remove('_') }
+
+    $script:Returning = $oldReturning
+    $script:ReturnValue = $oldReturnValue
+    return $result
+}
+
+function Assign-ScalarList([string]$Lhs, [string]$Rhs, [int]$LineNo) {
+    $lhsText = Trim-Text $Lhs
+    if (-not ($lhsText.StartsWith('(') -and $lhsText.EndsWith(')'))) { Die 'expected ( $x, $y )' $LineNo }
+    $vars = @(Split-Args $lhsText.Substring(1, $lhsText.Length - 2))
+    $arrName = Get-ArrayName $Rhs
+    for ($i = 0; $i -lt $vars.Count; $i++) {
+        $v = Trim-Text $vars[$i]
+        if ($v -match '^\$([A-Za-z_][A-Za-z0-9_]*)$') {
+            $varName = $Matches[1]
+        } else {
+            Die 'expected scalar variable in my list' $LineNo
+        }
+        Declare-Scalar $varName
+        $script:Scalars[$varName] = if ($i -lt $script:Arrays[$arrName].Count) { $script:Arrays[$arrName][$i] } else { '' }
+    }
+}
+
+function Exec-Statement([string]$Line, [int]$Pc) {
+    $line = Strip-TrailingSemicolon (Trim-Text $Line)
+    $script:CurrentLine = $Pc + 1
+
+    if ($line -eq 'use strict') { $script:StrictMode = $true; return $true }
+    if ($line -eq 'use warnings') { return $true }
+
+    if ($line -match '^my\s*(\([^)]+\))\s*=\s*(@[A-Za-z_][A-Za-z0-9_]*)$') {
+        Assign-ScalarList $Matches[1] $Matches[2] ($Pc + 1)
+        return $true
+    }
+    if ($line -match '^return(\s+.*)?$') {
+        if ($script:SubCallDepth -le 0) { Die 'return used outside subroutine' ($Pc + 1) }
+        $expr = ($line -replace '^return\s*', '')
+        $script:ReturnValue = if ($expr -eq '') { '' } else { Eval-Expr $expr }
+        $script:Returning = $true
+        return $true
+    }
+    if ($line -match '^my\s+\$([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*(.*))?$') {
+        Declare-Scalar $Matches[1]
+        $script:Scalars[$Matches[1]] = if ($Matches[3]) { Eval-Expr $Matches[3] } else { '' }
+        return $true
+    }
+    if ($line -match '^my\s+@([A-Za-z_][A-Za-z0-9_]*)$') { Declare-Array $Matches[1]; return $true }
+    if ($line -match '^my\s+%([A-Za-z_][A-Za-z0-9_]*)$') { Declare-Hash $Matches[1]; return $true }
+
+    if ($line -match '^\$([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]\s*=\s*(.*)$' -or $line -match '^@([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]\s*=\s*(.*)$') {
+        Set-ArrayValue $Matches[1] ([int](Eval-Expr $Matches[2])) (Eval-Expr $Matches[3])
+        return $true
+    }
+    if ($line -match '^\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
+        Require-Scalar $Matches[1] ($Pc + 1)
+        $script:Scalars[$Matches[1]] = Eval-Expr $Matches[2]
+        return $true
+    }
+    if ($line -match '^@([A-Za-z_][A-Za-z0-9_]*)\s*=\s*split\((.*)\)$') {
+        $name = $Matches[1]
+        Require-Array $name ($Pc + 1)
+        $args = @(Split-Args $Matches[2])
+        if ($args.Count -ne 2) { Die 'split expects two arguments' ($Pc + 1) }
+        if ((Is-RegexLiteral $args[0]) -and -not (Is-RegexLiteral $args[1])) {
+            $pattern = Get-RegexBody $args[0]
+            $text = [string](Eval-Expr $args[1])
+        } else {
+            $text = [string](Eval-Expr $args[0])
+            $pattern = Get-RegexBody $args[1]
+        }
+        Clear-ArrayValue $name
+        foreach ($part in [regex]::Split($text, $pattern)) { [void]$script:Arrays[$name].Add($part) }
+        return $true
+    }
+    if ($line -match '^@([A-Za-z_][A-Za-z0-9_]*)\s*=\s*grep\((.*)\)$') {
+        $name = $Matches[1]
+        Require-Array $name ($Pc + 1)
+        $args = @(Split-Args $Matches[2])
+        if ($args.Count -ne 2) { Die 'grep expects /regex/, @array' ($Pc + 1) }
+        $src = Get-ArrayName $args[1]
+        Clear-ArrayValue $name
+        foreach ($item in $script:Arrays[$src]) {
+            if ([string]$item -match (Get-RegexBody $args[0])) { [void]$script:Arrays[$name].Add($item) }
+        }
+        return $true
+    }
+    if ($line -match '^\$[A-Za-z_][A-Za-z0-9_]*\{[^}]+\}\s*=' -or $line -match '^%[A-Za-z_][A-Za-z0-9_]*\[[^\]]+\]\s*=') {
+        $lhs = $line -replace '\s*=.*$', ''
+        $rhs = $line -replace '^[^=]+=\s*', ''
+        $hashName = Get-HashName $lhs
+        $key = Get-HashKey $lhs
+        $script:Hashes[$hashName][$key] = Eval-Expr $rhs
+        return $true
+    }
+    if ($line -match '^delete\s+(.+)$') {
+        $hashName = Get-HashName $Matches[1]
+        $key = Get-HashKey $Matches[1]
+        $script:Hashes[$hashName].Remove($key)
+        return $true
+    }
+    if ($line -match '^push\s*\(\s*@([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(.*)\)$' -or $line -match '^push\s+@([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(.*)$') {
+        Require-Array $Matches[1] ($Pc + 1)
+        [void]$script:Arrays[$Matches[1]].Add([string](Eval-Expr $Matches[2]))
+        return $true
+    }
+    if ($line -match '^unshift\s*\(\s*@([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(.*)\)$' -or $line -match '^unshift\s+@([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(.*)$') {
+        Require-Array $Matches[1] ($Pc + 1)
+        $script:Arrays[$Matches[1]].Insert(0, [string](Eval-Expr $Matches[2]))
+        return $true
+    }
+    if ($line -match '^chomp\s*\(\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*\)$' -or $line -match '^chomp\s+\$([A-Za-z_][A-Za-z0-9_]*)$') {
+        $script:Scalars[$Matches[1]] = Eval-Expr ('chomp($' + $Matches[1] + ')')
+        return $true
+    }
+    if ($line -match '^chop\s*\(\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*\)$' -or $line -match '^chop\s+\$([A-Za-z_][A-Za-z0-9_]*)$') {
+        $script:Scalars[$Matches[1]] = Eval-Expr ('chop($' + $Matches[1] + ')')
+        return $true
+    }
+    if ($line -match '^print\s*\((.*)\)$' -or $line -match '^print\s+(.+)$') {
+        [Console]::Out.WriteLine([string](Eval-Expr $Matches[1]))
+        return $true
+    }
+    if ($line -match '^(write|append)\s+(.+)$') {
+        $mode = $Matches[1]
+        $args = @(Split-Args $Matches[2])
+        if ($args.Count -ne 2) { Die "$mode expects path, value" ($Pc + 1) }
+        $path = [string](Eval-Expr $args[0])
+        $value = [string](Eval-Expr $args[1])
+        if ($mode -eq 'write') { Set-Content -LiteralPath $path -Value $value }
+        else { Add-Content -LiteralPath $path -Value $value }
+        return $true
+    }
+    if ($line -match '^[A-Za-z_][A-Za-z0-9_]*(\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*\(.*\)$') {
+        [void](Eval-Expr $line)
+        return $true
+    }
+    return $false
+}
+
+function Exec-IfChain([int]$StartPc, [int]$Stop) {
+    $pc = $StartPc
+    $taken = $false
+    while ($pc -le $Stop) {
+        $branch = Next-CodeLine $pc $Stop
+        if ($branch -gt $Stop) { break }
+        $line = Strip-Comment $script:Program[$branch]
+        $handled = $false
+        if ($branch -eq $StartPc) {
+            $cond = Parse-CondHeader 'if' $line
+        } else {
+            $cond = Parse-CondHeader 'elsif' $line
+        }
+        if ($null -ne $cond) {
+            $handled = $true
+            if ($cond.Inline) {
+                if (-not $taken -and [bool](Eval-Expr $cond.Expr)) {
+                    if (-not (Exec-Statement $cond.Stmt $branch)) { Die "unknown statement: $($cond.Stmt)" ($branch + 1) }
+                    $taken = $true
+                }
+                if ($script:Returning) { return (Skip-IfTail ($branch + 1) $Stop) }
+                $pc = $branch + 1
+            } else {
+                $end = Find-BlockEnd $branch $Stop
+                if (-not $taken -and [bool](Eval-Expr $cond.Expr)) {
+                    Exec-Block ($branch + 1) ($end - 1)
+                    $taken = $true
+                }
+                if ($script:Returning) { return (Skip-IfTail ($end + 1) $Stop) }
+                $pc = $end + 1
+            }
+        } elseif ($branch -ne $StartPc) {
+            $else = Parse-ElseHeader $line
+            if ($null -ne $else) {
+                $handled = $true
+                if ($else.Inline) {
+                    if (-not $taken) {
+                        if (-not (Exec-Statement $else.Stmt $branch)) { Die "unknown statement: $($else.Stmt)" ($branch + 1) }
+                    }
+                    return ($branch + 1)
+                }
+                $end = Find-BlockEnd $branch $Stop
+                if (-not $taken) { Exec-Block ($branch + 1) ($end - 1) }
+                return ($end + 1)
+            }
+        }
+        if (-not $handled) { break }
+    }
+    if ($pc -le $Stop -and (Strip-Comment $script:Program[$pc]) -match '^\}\s*$') { $pc++ }
+    return $pc
+}
+
+function Exec-Block([int]$Start, [int]$Stop) {
+    $pc = $Start
+    while ($pc -le $Stop) {
+        $line = Strip-Comment $script:Program[$pc]
+        if ($line -eq '' -or $line -eq '}') { $pc++; continue }
+
+        $subName = Parse-SubHeader $line
+        if ($null -ne $subName) {
+            $pc = $script:SubEnd[$subName] + 1
+            continue
+        }
+
+        if ($null -ne (Parse-CondHeader 'if' $line)) {
+            $pc = Exec-IfChain $pc $Stop
+            continue
+        }
+
+        $loop = Parse-ForeachHeader $line
+        if ($null -ne $loop) {
+            if ($loop.Declared) { Declare-Scalar $loop.Name }
+            else { Require-Scalar $loop.Name ($pc + 1) }
+            Require-Array $loop.Array ($pc + 1)
+            $end = Find-BlockEnd $pc $Stop
+            for ($i = 0; $i -lt $script:Arrays[$loop.Array].Count; $i++) {
+                $script:Scalars[$loop.Name] = $script:Arrays[$loop.Array][$i]
+                Exec-Block ($pc + 1) ($end - 1)
+                $script:Arrays[$loop.Array][$i] = $script:Scalars[$loop.Name]
+                if ($script:Returning) { break }
+            }
+            $pc = $end + 1
+            continue
+        }
+
+        if (Exec-Statement $line $pc) {
+            if ($script:Returning) { return }
+            $pc++
+            continue
+        }
+
+        Die "unknown statement: $line" ($pc + 1)
+    }
+}
+
+if (-not (Test-Path -LiteralPath $ProgramPath)) {
+    Die "program not found: $ProgramPath"
+}
+
+$fullProgramPath = (Resolve-Path -LiteralPath $ProgramPath).Path
+$baseDir = Split-Path -Parent $fullProgramPath
+$script:Program = @(Get-Content -LiteralPath $fullProgramPath)
+if ($script:Program.Count -eq 0) { Die 'empty program' }
+
+Push-Location $baseDir
+try {
+    Load-Modules $baseDir
+    Normalize-Program
+    Index-Subroutines
+    Exec-Block 0 ($script:Program.Count - 1)
+} finally {
+    Pop-Location
+}
