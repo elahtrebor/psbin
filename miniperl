@@ -1,3 +1,4 @@
+#!/usr/bin/env pwsh
 <#
 miniperl.ps1 - a small Perl-ish interpreter written in PowerShell.
 
@@ -264,6 +265,66 @@ function Invoke-MiniCommand([string]$Command) {
     return $out.TrimEnd("`r", "`n")
 }
 
+function Get-PowerShellExecutable() {
+    foreach ($name in @('pwsh', 'pwsh.exe', 'powershell', 'powershell.exe')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($null -ne $cmd) { return $cmd.Source }
+    }
+    Die 'could not locate pwsh or powershell for ps()'
+}
+
+function Invoke-PowerShellBridge([string]$Code, [object[]]$ArgList) {
+    $tempPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ([System.IO.Path]::GetRandomFileName() + '.ps1'))
+    try {
+        $renderedArgs = [System.Collections.Generic.List[string]]::new()
+        foreach ($arg in $ArgList) {
+            if ($null -eq $arg -or $arg -is [DBNull]) {
+                [void]$renderedArgs.Add('$null')
+            } elseif ($arg -is [bool]) {
+                [void]$renderedArgs.Add((if ($arg) { '$true' } else { '$false' }))
+            } elseif ($arg -is [byte] -or $arg -is [sbyte] -or $arg -is [int16] -or $arg -is [int32] -or $arg -is [int64] -or $arg -is [single] -or $arg -is [double] -or $arg -is [decimal]) {
+                [void]$renderedArgs.Add([string]$arg)
+            } else {
+                $escaped = [string]$arg -replace "'", "''"
+                [void]$renderedArgs.Add(("'{0}'" -f $escaped))
+            }
+        }
+
+        $wrapper = [System.Text.StringBuilder]::new()
+        [void]$wrapper.AppendLine('& {')
+        [void]$wrapper.AppendLine($Code)
+        [void]$wrapper.Append('} ')
+        [void]$wrapper.Append(($renderedArgs -join ' '))
+        Set-Content -LiteralPath $tempPath -Value $wrapper.ToString() -NoNewline
+
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = Get-PowerShellExecutable
+        $psi.ArgumentList.Add('-NoProfile')
+        $psi.ArgumentList.Add('-NonInteractive')
+        $psi.ArgumentList.Add('-File')
+        $psi.ArgumentList.Add($tempPath)
+        foreach ($arg in $ArgList) {
+            $psi.ArgumentList.Add([string]$arg)
+        }
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEnd()
+        $err = $p.StandardError.ReadToEnd()
+        $p.WaitForExit()
+        if ($p.ExitCode -ne 0) {
+            $message = $err.Trim()
+            if ($message -eq '') { $message = "exit code $($p.ExitCode)" }
+            Die "ps() failed: $message"
+        }
+        return $out.TrimEnd("`r", "`n")
+    } finally {
+        Remove-Item -LiteralPath $tempPath -ErrorAction SilentlyContinue
+    }
+}
+
 function Replace-Regex([string]$Text, [string]$Pattern, [string]$Replacement, [string]$Flags) {
     if ($Flags -eq 'g' -or $Flags -eq 'G') {
         return [regex]::Replace($Text, $Pattern, $Replacement)
@@ -387,6 +448,15 @@ function Eval-Expr([string]$Expr) {
                 return (Get-Content -LiteralPath $path -Raw).TrimEnd("`r", "`n")
             }
             'run' { return Invoke-MiniCommand ([string](Eval-Expr $argList[0])) }
+            'ps' {
+                if ($argList.Count -lt 1) { Die 'ps expects code, [args...]' }
+                $code = [string](Eval-Expr $argList[0])
+                $args = @()
+                for ($i = 1; $i -lt $argList.Count; $i++) {
+                    $args += ,(Eval-Expr $argList[$i])
+                }
+                return Invoke-PowerShellBridge $code $args
+            }
             'pop' {
                 $arrName = Get-ArrayName $argList[0]
                 $arr = $script:Arrays[$arrName]
